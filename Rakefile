@@ -2,9 +2,38 @@
 
   #  a Rakefile is a command line aggregator
 
+  # .---.
+  #               /  .-.  \
+  #              /  /   \  \
+  #             /  /  .-.|  |
+  #            |  |  /  ||  |
+  #       /\   |  | |   '|  |
+  #      /  \  |  |  \___|  |   /\
+  #     / /\ \ |  |    .-.  |  /  \
+  #    | |  \ \|  |   /   \ | / /\ \
+  #    | |   \ '  |  /     \|/ /  | |
+  #     \ \   \   | /   /\    /  / /
+  #      \ \   |  |/   /  \  /  / /
+  #       \ \  |  |   |    \/  / /
+  #        \ \/   /    \      / /
+  #         \____/      \____/
+  #
+  #   _   _ _   _ ____  _____    _    _
+  #  | | | | \ | |  _ \|  ___|  / \  | |
+  #  | | | |  \| | |_) | |_    / _ \ | |
+  #  | |_| | |\  |  _ <|  _|  / ___ \| |___
+  #   \___/|_| \_|_| \_\_|   /_/   \_\_____|
+  #
+  #  _____ ____  _   _ ____  _   _    _    __  __ _____ _  _ _____
+  # |_   _/ __ \| | | |  _ \| \ | |  / \  |  \/  | ____| \| |_   _|
+  #   | || |  | | | | | |_) |  \| | / _ \ | |\/| |  _| | .` | | |
+  #   | || |__| | |_| |  _ <| |\  |/ ___ \| |  | | |___| |\  | | |
+  #   |_| \____/ \___/|_| \_|_| \_/_/   \_\_|  |_|_____|_| \_| |_|
+
 
 require 'fileutils'
 require 'digest'
+require 'shellwords'
 
 # TODO  ask mr machine to write a task that opens a Rakefile in the target vicinity
 
@@ -13,7 +42,7 @@ ANTHROPIC_BASE_URL = ENV['ANTHROPIC_BASE_URL'] || 'https://app-llmproxy.surgehq.
 ANTHROPIC_USER_ID = ENV['ANTHROPIC_USER_ID']
 
 namespace :claude do
-  desc "Run claude-code on a target path using CLAUDE.md guidelines"
+  desc "Run claude on a target path using CLAUDE.md guidelines (invokes the actual CLI binary name, `claude`)"
   task :run, [:path] do |_t, args|
     target_path = File.expand_path(args[:path] || '.')
     claude_md = File.join(target_path, 'CLAUDE.md')
@@ -27,8 +56,66 @@ namespace :claude do
       'ANTHROPIC_USER_ID' => ANTHROPIC_USER_ID
     }.compact
 
-    # Invokes claude-code within the context directory of the targeted CLAUDE.md
-    system(env, 'claude-code', chdir: target_path) || raise("claude-code execution failed")
+    # Invokes claude within the context directory of the targeted CLAUDE.md
+    system(env, 'claude', chdir: target_path) || raise("claude execution failed")
+  end
+
+  CLAUDE_IMAGE = 'claude-sandbox'
+
+  desc 'Run Claude Code in a Docker container on a target path (interactive, or headless with a prompt)'
+  task :docker, [:path, :prompt] do |_t, args|
+    target_path = File.expand_path(args[:path] || '.')
+    raise "No such directory: #{target_path}" unless Dir.exist?(target_path)
+    raise "Missing ANTHROPIC_API_KEY" if ANTHROPIC_API_KEY.nil? || ANTHROPIC_API_KEY.empty?
+
+    # Built from stdin so no Dockerfile lands in the target; the node image's
+    # `node` user is uid 1000, which matches the usual host user for the mount
+    dockerfile = <<~DOCKER
+      FROM node:20-bookworm
+      RUN apt-get update && apt-get install -y --no-install-recommends git ripgrep \\
+       && rm -rf /var/lib/apt/lists/*
+      RUN npm install -g @anthropic-ai/claude-code
+      USER node
+      WORKDIR /workspace
+    DOCKER
+    IO.popen(['docker', 'build', '-t', CLAUDE_IMAGE, '-'], 'w') { |io| io.write(dockerfile) }
+    raise 'docker build failed' unless $?.success?
+    warn "Host uid is #{Process.uid}, container user is 1000; file ownership may not match" unless Process.uid == 1000
+
+    # `-e NAME` with no value copies it from this process, keeping keys out of the command line
+    ENV['ANTHROPIC_BASE_URL'] ||= ANTHROPIC_BASE_URL
+    cmd = %w[docker run --rm]
+    cmd << '-it' if args[:prompt].nil?
+    %w[ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_USER_ID].each { |name| cmd.push('-e', name) if ENV[name] }
+    cmd.push('-v', "#{target_path}:/workspace", CLAUDE_IMAGE, 'claude')
+    if args[:prompt]
+      cmd.push('-p', args[:prompt])
+      # Edits land on the mounted host directory, so skipping prompts is opt-in
+      cmd << '--dangerously-skip-permissions' if ENV['SKIP_PERMISSIONS'] == '1'
+    end
+
+    system(*cmd) || raise('claude (docker) execution failed')
+  end
+
+  desc 'Run Claude Code in a throwaway ubuntu:24.04 container, installed fresh each time (headless with a prompt)'
+  task :popup, [:path, :prompt] do |_t, args|
+    target_path = File.expand_path(args[:path] || '.')
+    raise "No such directory: #{target_path}" unless Dir.exist?(target_path)
+    raise "Missing ANTHROPIC_API_KEY" if ANTHROPIC_API_KEY.nil? || ANTHROPIC_API_KEY.empty?
+
+    # Runs as root: files it creates in the mount are root-owned
+    claude = ['exec ~/.local/bin/claude']
+    claude.push('-p', Shellwords.escape(args[:prompt])) if args[:prompt]
+    setup = 'apt-get update -qq && apt-get install -y -qq curl ca-certificates git >/dev/null' \
+            ' && curl -fsSL https://claude.ai/install.sh | bash && ' + claude.join(' ')
+
+    ENV['ANTHROPIC_BASE_URL'] ||= ANTHROPIC_BASE_URL
+    cmd = %w[docker run --rm]
+    cmd << '-it' if args[:prompt].nil?
+    %w[ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_USER_ID].each { |name| cmd.push('-e', name) if ENV[name] }
+    cmd.push('-v', "#{target_path}:/work", '-w', '/work', 'ubuntu:24.04', 'bash', '-c', setup)
+
+    system(*cmd) || raise('claude (popup) execution failed')
   end
 end
 # ==============================================================================
@@ -240,6 +327,63 @@ def require_slug(args)
 end
 
 namespace :task do
+
+  desc 'List snapshots and harbor tasks, with how far along each task is'
+  task :list do
+    snapshots = Dir.glob(File.join(TASK_TOOLKIT, 'explore', 'snapshots', '*')).select { |d| File.directory?(d) }
+    tasks = Dir.glob(File.join(TASK_TOOLKIT, 'harbor-tasks', '*')).select { |d| File.directory?(d) }
+                .reject { |d| File.basename(d).start_with?('_') }
+
+    puts "Snapshots (explore/snapshots/) — build with task:from_snapshot[<path>]:"
+    puts '  (none yet)' if snapshots.empty?
+    snapshots.sort.each { |d| puts "  explore/snapshots/#{File.basename(d)}" }
+
+    puts "\nHarbor tasks (harbor-tasks/):"
+    puts '  (none yet)' if tasks.empty?
+    tasks.sort.each do |dir|
+      runs = Dir.glob(File.join(dir, 'reference-runs', '*')).count { |d| File.directory?(d) }
+      marks = {
+        'workspace' => Dir.exist?(File.join(dir, 'environment', 'workspace')),
+        'rubric'    => File.exist?(File.join(dir, 'tests', 'holistic-rubric.md')),
+        'atomic'    => File.exist?(File.join(dir, 'tests', 'atomic-rubric.yaml'))
+      }.map { |name, ok| "#{ok ? '✔' : '·'} #{name}" }
+      ready = runs >= MIN_REFERENCE_RUNS ? 'ready to submit' : "#{runs}/#{MIN_REFERENCE_RUNS} runs"
+      puts format('  %-40s %s  %s', File.basename(dir), marks.join('  '), ready)
+    end
+  end
+
+  desc 'List open upstream human-essentials issues as candidate task seeds'
+  task :seeds, [:label, :limit] do |_t, args|
+    require 'net/http'
+    require 'json'
+    require 'uri'
+
+    limit = (args[:limit] || 30).to_i
+    params = { state: 'open', sort: 'created', direction: 'desc', per_page: [limit, 100].min }
+    params[:labels] = args[:label] if args[:label]
+    url = URI("https://api.github.com/repos/rubyforgood/human-essentials/issues?#{URI.encode_www_form(params)}")
+
+    req = Net::HTTP::Get.new(url)
+    req['Accept'] = 'application/vnd.github.v3+json'
+    req['User-Agent'] = 'Ruby-Rake-Scanner'
+    req['Authorization'] = "Bearer #{ENV['GITHUB_TOKEN']}" if ENV['GITHUB_TOKEN']
+    res = Net::HTTP.start(url.host, url.port, use_ssl: true) { |http| http.request(req) }
+    raise "GitHub API Error [#{res.code}]: #{res.body}" unless res.is_a?(Net::HTTPSuccess)
+
+    # Issues filed after the pinned commit may describe code the workspace doesn't have yet
+    pinned = `git -C #{File.join(TASK_TOOLKIT, 'repo')} log -1 --format=%cI`.strip
+    issues = JSON.parse(res.body).reject { |i| i['pull_request'] }
+
+    puts "Open issues (workspace pinned at #{pinned[0, 10]}; * = filed after it):"
+    issues.each do |i|
+      after = !pinned.empty? && i['created_at'] > pinned ? '*' : ' '
+      labels = i['labels'].map { |l| l['name'] }.join(', ')
+      puts format('%s #%-5d %s  %s', after, i['number'], i['created_at'][0, 10], i['title'])
+      puts "         [#{labels}]" unless labels.empty?
+      puts "         #{i['html_url']}"
+    end
+  end
+
   desc 'Build a harbor task from an explore snapshot'
   task :from_snapshot, [:snapshot] do |_t, args|
     raise 'Usage: rake "task:from_snapshot[explore/snapshots/<dir>]"' unless args[:snapshot]
@@ -274,8 +418,17 @@ namespace :task do
     toolkit_sh "scripts/harbor-regrade harbor-tasks/#{require_slug(args)} --all"
   end
 
+  desc 'Fail unless the task has a holistic rubric'
+  task :rubric, [:slug] do |_t, args|
+    slug = require_slug(args)
+    unless File.exist?(File.join(TASK_TOOLKIT, 'harbor-tasks', slug, 'tests', 'holistic-rubric.md'))
+      raise "#{slug} has no tests/holistic-rubric.md; write it (/write-holistic-rubric) before grading or submitting. " \
+            'task:all_runs runs trials without it.'
+    end
+  end
+
   desc 'Validate and package a task for submission'
-  task :submit, [:slug] do |_t, args|
+  task :submit, [:slug] => :rubric do |_t, args|
     slug = require_slug(args)
     runs = Dir.glob(File.join(TASK_TOOLKIT, 'harbor-tasks', slug, 'reference-runs', '*')).select { |d| File.directory?(d) }
     if runs.size < MIN_REFERENCE_RUNS
@@ -284,8 +437,11 @@ namespace :task do
     toolkit_sh "npx tsx scripts/submit-task.ts #{slug}"
   end
 
-  desc 'Full chain: build -> run -> reference -> submit'
-  task :all, [:slug, :trials] => %i[run reference submit]
+  desc 'Trials only: build -> run -> reference (no rubric needed)'
+  task :all_runs, [:slug, :trials] => %i[run reference]
+
+  desc 'Full chain, after the rubric is written: rubric check -> build -> run -> reference -> submit'
+  task :all, [:slug, :trials] => %i[rubric run reference submit]
 end
 
 
