@@ -1,0 +1,2 @@
+# Dot folders anywhere under the task toolkit (.claude, .devcontainer, repo/.git, ...)
+awbw/worker-toolkit-human-essentials/**/.*/
