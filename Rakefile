@@ -2,6 +2,10 @@
 
   #  a Rakefile is a command line aggregator
 
+  # TODO  system to download a Dockerfile environment
+# ask mr machine to
+  #  curl -LsSf https://astral.sh/uv/install.sh | sh
+
   # .---.
   #               /  .-.  \
   #              /  /   \  \
@@ -46,7 +50,6 @@ namespace :claude do
   task :run, [:path] do |_t, args|
     target_path = File.expand_path(args[:path] || '.')
     claude_md = File.join(target_path, 'CLAUDE.md')
-
     raise "Missing CLAUDE.md at: #{claude_md}" unless File.exist?(claude_md)
     raise "Missing ANTHROPIC_API_KEY" if ANTHROPIC_API_KEY.nil? || ANTHROPIC_API_KEY.empty?
 
@@ -57,7 +60,7 @@ namespace :claude do
     }.compact
 
     # Invokes claude within the context directory of the targeted CLAUDE.md
-    system(env, 'claude', chdir: target_path) || raise("claude execution failed")
+    system(env, 'claude-code', chdir: target_path) || raise("claude execution failed")
   end
 
   CLAUDE_IMAGE = 'claude-sandbox'
@@ -93,8 +96,8 @@ namespace :claude do
       # Edits land on the mounted host directory, so skipping prompts is opt-in
       cmd << '--dangerously-skip-permissions' if ENV['SKIP_PERMISSIONS'] == '1'
     end
-
-    system(*cmd) || raise('claude (docker) execution failed')
+p cmd
+    # system(*cmd) || raise('claude (docker) execution failed')
   end
 
   desc 'Run Claude Code in a throwaway ubuntu:24.04 container, installed fresh each time (headless with a prompt)'
@@ -319,6 +322,46 @@ def toolkit_sh(cmd)
   cd(TASK_TOOLKIT) { sh cmd }
 end
 
+# The scaffold ships a template holistic-rubric.md, so existence alone doesn't mean it's written
+def rubric_written?(task_dir)
+  rubric = File.join(task_dir, 'tests', 'holistic-rubric.md')
+  template = File.join(TASK_TOOLKIT, 'harbor-tasks', '_task-scaffold', 'tests', 'holistic-rubric.md')
+  File.exist?(rubric) && !(File.exist?(template) && FileUtils.identical?(rubric, template))
+end
+
+# The grader reaches the model API with these; the scaffold's [verifier.env] ships both
+VERIFIER_REQUIRED_KEYS = %w[ANTHROPIC_API_KEY ANTHROPIC_BASE_URL].freeze
+
+# Stdlib has no TOML parser; this reads flat `KEY = "value"` lines from one table, which is all [verifier.env] holds
+def toml_table(path, name)
+  return nil unless File.exist?(path)
+  table = nil
+  current = nil
+  File.foreach(path) do |line|
+    if (header = line[/\A\s*\[([^\]]+)\]\s*(#.*)?\z/, 1])
+      current = header.strip
+      table ||= {} if current == name
+    elsif current == name && (m = line.match(/\A\s*([A-Za-z_][\w-]*)\s*=\s*(["'])(.*)\2\s*(#.*)?\z/))
+      table[m[1]] = m[3]
+    end
+  end
+  table
+end
+
+# harbor-run sources the toolkit's .env, so ${VAR}s can resolve from there as well as the shell
+def dotenv_vars(path)
+  return {} unless File.exist?(path)
+  File.foreach(path).each_with_object({}) do |line, vars|
+    m = line.match(/\A\s*(?:export\s+)?([A-Za-z_]\w*)=(.*)\z/) or next
+    vars[m[1]] = m[2].strip.sub(/\A(["'])(.*)\1\z/, '\2')
+  end
+end
+
+def mask_env(name, value)
+  return value unless name =~ /KEY|TOKEN|SECRET|PASSWORD/i
+  "set, #{value.length} chars, …#{value[-4..] || ''}"
+end
+
 def require_slug(args)
   slug = args[:slug]
   raise 'Usage: rake "task:<target>[slug]"' if slug.nil? || slug.empty?
@@ -344,12 +387,82 @@ namespace :task do
       runs = Dir.glob(File.join(dir, 'reference-runs', '*')).count { |d| File.directory?(d) }
       marks = {
         'workspace' => Dir.exist?(File.join(dir, 'environment', 'workspace')),
-        'rubric'    => File.exist?(File.join(dir, 'tests', 'holistic-rubric.md')),
+        'rubric'    => rubric_written?(dir),
         'atomic'    => File.exist?(File.join(dir, 'tests', 'atomic-rubric.yaml'))
       }.map { |name, ok| "#{ok ? '✔' : '·'} #{name}" }
       ready = runs >= MIN_REFERENCE_RUNS ? 'ready to submit' : "#{runs}/#{MIN_REFERENCE_RUNS} runs"
       puts format('  %-40s %s  %s', File.basename(dir), marks.join('  '), ready)
     end
+  end
+
+  desc 'Examine [verifier.env] in task.toml: required keys, ${VAR} references, and whether each resolves (all tasks if no slug)'
+  task :verifier_env, [:slug] do |_t, args|
+    tasks_dir = File.join(TASK_TOOLKIT, 'harbor-tasks')
+    known = Dir.glob(File.join(tasks_dir, '*')).select { |d| File.directory?(d) }
+               .map { |d| File.basename(d) }.reject { |s| s.start_with?('_') }.sort
+    slug = args[:slug].to_s.strip
+    usage = 'Usage: rake "task:verifier_env[<slug>]", where <slug> is a folder name under ' \
+            "#{tasks_dir}/ (e.g. donation-new-cancel-button). Omit [<slug>] to check every task."
+
+    if known.empty?
+      raise "No harbor tasks found in #{tasks_dir}/. Build one first with task:from_snapshot[<snapshot>]. #{usage}"
+    end
+
+    dirs = if slug.empty?
+             puts "No slug given, so checking all #{known.size} task(s) under #{tasks_dir}/: #{known.join(', ')}"
+             puts usage
+             known.map { |s| File.join(tasks_dir, s) }
+           elsif slug.start_with?('_')
+             raise "#{slug} is the toolkit's template, not a task; pass a real task slug. Known slugs: #{known.join(', ')}. #{usage}"
+           elsif known.include?(slug)
+             [File.join(tasks_dir, slug)]
+           else
+             near = known.select { |s| s.include?(slug) || slug.include?(s) }
+             hint = near.empty? ? '' : " Did you mean: #{near.join(', ')}?"
+             raise "No task named \"#{slug}\" in #{tasks_dir}/.#{hint} Known slugs: #{known.join(', ')}. #{usage}"
+           end
+    dotenv = dotenv_vars(File.join(TASK_TOOLKIT, '.env'))
+    scaffold = toml_table(File.join(TASK_TOOLKIT, 'harbor-tasks', '_task-scaffold', 'task.toml'), 'verifier.env') || {}
+    failed = []
+
+    dirs.each do |dir|
+      slug = File.basename(dir)
+      puts "\nSlug: #{slug}"
+      table = toml_table(File.join(dir, 'task.toml'), 'verifier.env')
+      if table.nil?
+        puts '  ✘ no [verifier.env] table — the grader gets no API credentials'
+        failed << slug
+        next
+      end
+
+      problems = 0
+      VERIFIER_REQUIRED_KEYS.each do |key|
+        next if table.key?(key)
+        puts "  ✘ #{key} missing — the grader needs it to reach the model API"
+        problems += 1
+      end
+
+      table.each do |key, value|
+        ref = value[/\A\$\{(\w+)\}\z/, 1]
+        unless ref
+          puts "  ⚠ #{key} = literal value (#{mask_env(key, value)}) — use \"${#{key}}\" so nothing secret ships in task.toml"
+          next
+        end
+        resolved, source = ENV.key?(ref) ? [ENV[ref], 'shell'] : [dotenv[ref], '.env']
+        if resolved.to_s.empty?
+          puts "  ✘ #{key} = ${#{ref}} — unset in the shell and in #{TASK_TOOLKIT}/.env"
+          problems += 1
+        else
+          puts "  ✔ #{key} = ${#{ref}} → #{mask_env(ref, resolved)} (from #{source})"
+        end
+      end
+
+      drift = (scaffold.keys - table.keys) + (table.keys - scaffold.keys)
+      puts "  · differs from the scaffold's [verifier.env] in: #{drift.join(', ')}" unless drift.empty?
+      failed << slug if problems.positive?
+    end
+
+    raise "[verifier.env] problems in: #{failed.join(', ')}" unless failed.empty?
   end
 
   desc 'List open upstream human-essentials issues as candidate task seeds'
@@ -421,8 +534,8 @@ namespace :task do
   desc 'Fail unless the task has a holistic rubric'
   task :rubric, [:slug] do |_t, args|
     slug = require_slug(args)
-    unless File.exist?(File.join(TASK_TOOLKIT, 'harbor-tasks', slug, 'tests', 'holistic-rubric.md'))
-      raise "#{slug} has no tests/holistic-rubric.md; write it (/write-holistic-rubric) before grading or submitting. " \
+    unless rubric_written?(File.join(TASK_TOOLKIT, 'harbor-tasks', slug))
+      raise "#{slug} has no written tests/holistic-rubric.md (missing, or still the scaffold template); write it (/write-holistic-rubric) before grading or submitting. " \
             'task:all_runs runs trials without it.'
     end
   end
@@ -444,6 +557,29 @@ namespace :task do
   task :all, [:slug, :trials] => %i[rubric run reference submit]
 end
 
+namespace :app do
+  EXPLORE_DIR = File.join(TASK_TOOLKIT, 'explore')
+
+  # `run-app` is only an interactive alias in the container, so call its script
+  def run_app(flag = nil)
+    cd(EXPLORE_DIR) do
+      sh 'npx @devcontainers/cli up --workspace-folder .'
+      sh "npx @devcontainers/cli exec --workspace-folder . bash /workspace/run-app.sh #{flag}".strip
+    end
+  end
+
+  desc 'Start the Explore container and boot the human-essentials app (http://localhost:3400, test@example.com / password!)'
+  task(:run) { run_app }
+
+  desc 'Stop the app in the Explore container'
+  task(:stop) { run_app '--stop' }
+
+  desc 'Restart the app after a code change'
+  task(:restart) { run_app '--restart' }
+
+  desc 'Follow the app logs (Ctrl-C stops following, not the app)'
+  task(:logs) { run_app '--logs' }
+end
 
 require "io/console"
 
@@ -479,6 +615,37 @@ namespace :env do
       system("chromium", url) || system("chromium-browser", url) || raise("Failed to launch Chromium.")
     else
       raise "User declined setup."
+    end
+  end
+
+  # The toolkit's package.json pins node 24; distro apt nodejs is too old for its deps
+  NODE_MAJOR = 24
+
+  desc "apt-install the toolkit's prerequisites (Node #{NODE_MAJOR} via NodeSource, Docker, git, python3), then npm install"
+  task :apt do
+    sh 'sudo apt-get update'
+    sh 'sudo apt-get install -y curl ca-certificates git python3'
+    # docker.io conflicts with Docker's own docker-ce packages, so only fill a gap
+    if system('which docker > /dev/null 2>&1')
+      puts "Docker already installed: #{`docker --version`.strip}"
+    else
+      sh 'sudo apt-get install -y docker.io'
+    end
+
+    node_major = `node -v 2>/dev/null`[/\Av(\d+)/, 1].to_i
+    if node_major == NODE_MAJOR
+      puts "Node #{`node -v`.strip} already installed."
+    else
+      puts "Node #{node_major.zero? ? 'missing' : "v#{node_major}"}; adding NodeSource's apt repo for #{NODE_MAJOR}.x"
+      sh "curl -fsSL https://deb.nodesource.com/setup_#{NODE_MAJOR}.x | sudo -E bash -"
+      sh 'sudo apt-get install -y nodejs'
+    end
+
+    toolkit_sh 'npm install'
+
+    unless `id -nG`.split.include?('docker')
+      sh "sudo usermod -aG docker #{ENV['USER']}"
+      puts 'Added you to the docker group; log out and back in (or run `newgrp docker`) before harbor-run.'
     end
   end
 end
