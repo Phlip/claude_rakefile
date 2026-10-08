@@ -1,0 +1,1 @@
+On the New Donation page there's no way to back out — if someone opens the form and decides not to record a donation, they have to use the browser back button or the sidebar. Can you add a Cancel button that takes them back to the donations list? Please add tests for it.

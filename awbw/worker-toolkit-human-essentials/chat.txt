@@ -1,0 +1,1 @@
+rbenv install $(rbenv install -l | grep -E '^3\.3\.' | tail -1)

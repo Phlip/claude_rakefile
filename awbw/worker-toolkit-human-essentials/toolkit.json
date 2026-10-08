@@ -1,0 +1,11 @@
+{
+  "repo": "human-essentials",
+  "defaultCommit": "ae97376d",
+  "version": "037cfcf94b",
+  "explorePorts": {
+    "clientHost": 3400,
+    "serverHost": null,
+    "corpusHost": null,
+    "livereloadHost": null
+  }
+}

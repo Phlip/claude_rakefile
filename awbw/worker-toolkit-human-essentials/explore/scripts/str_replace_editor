@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""str_replace_editor — CLI-as-MCP wrapper around the vendored EditTool.
+
+This is the "CLI-as-MCP" delivery of the `str_replace_editor` tool: the agent
+(which has ONLY the bash tool) invokes this script and passes the tool's
+arguments as one JSON object on stdin. The actual editing logic is the vendored
+`EditTool` under str_replace_editor_vendor/ (see VENDORED.md) — we add no
+behavior, we only:
+  * instantiate it with run_command_preexec_fn=None (the class's own documented
+    way to skip its uid/gid-1000 demotion, which would break writes in our
+    sandbox where the workspace is owned by the agent user); and
+  * adapt structured stdin-JSON <-> a bash-invokable CLI.
+
+stdin: one JSON object, e.g.
+  {"command":"view","path":"/workspace/app/models/x.rb"}
+  {"command":"view","path":"/workspace/x.rb","view_range":[1,40]}
+  {"command":"str_replace","path":"/workspace/x.rb","old_str":"a","new_str":"b"}
+  {"command":"create","path":"/workspace/new.rb","file_text":"..."}
+  {"command":"insert","path":"/workspace/x.rb","insert_line":10,"insert_text":"..."}
+stdout: the tool's result text (exit 0). stderr + exit 1: a tool error message.
+"""
+
+import asyncio
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from str_replace_editor_vendor.base import ToolError  # noqa: E402
+from str_replace_editor_vendor.edit import EditTool  # noqa: E402
+
+# The keyword-only params the vendored EditTool.__call__ accepts.
+_ACCEPTED = {
+    "command", "path", "file_text", "view_range",
+    "old_str", "new_str", "insert_text", "insert_line",
+}
+
+
+async def _run(payload: dict):
+    # Reject unknown keys instead of silently dropping them: a typo like
+    # `old_string` (vs `old_str`) should be a clear argument error, not a
+    # confusing failure deeper inside EditTool with the param silently missing.
+    unknown = set(payload) - _ACCEPTED
+    if unknown:
+        raise ToolError(
+            f"unknown argument(s): {', '.join(sorted(unknown))}. "
+            f"accepted keys: {', '.join(sorted(_ACCEPTED))}."
+        )
+    kwargs = dict(payload)
+    if "command" not in kwargs or "path" not in kwargs:
+        raise ToolError("Both `command` and `path` are required.")
+    # run_command_preexec_fn=None → no uid/gid demotion (see module docstring).
+    tool = EditTool(run_command_preexec_fn=None)
+    return await tool(**kwargs)
+
+
+def main() -> int:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        sys.stderr.write("str_replace_editor: expected a JSON object on stdin\n")
+        return 2
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"str_replace_editor: invalid JSON on stdin: {e}\n")
+        return 2
+    if not isinstance(payload, dict):
+        sys.stderr.write("str_replace_editor: stdin JSON must be an object\n")
+        return 2
+    try:
+        result = asyncio.run(_run(payload))
+    except ToolError as e:
+        sys.stderr.write((e.message or "tool error") + "\n")
+        return 1
+    except TypeError as e:
+        # e.g. an unexpected/duplicate kwarg shape — surface like a tool error.
+        sys.stderr.write(f"str_replace_editor: bad arguments: {e}\n")
+        return 1
+    # EditTool returns a (CLI)Result with .output / .error / .base64_image / .system
+    if getattr(result, "error", None):
+        sys.stderr.write(result.error if result.error.endswith("\n") else result.error + "\n")
+    if getattr(result, "system", None):
+        sys.stderr.write(f"[system] {result.system}\n")
+    out = getattr(result, "output", None) or ""
+    if getattr(result, "base64_image", None):
+        out += "\n(image content omitted in CLI mode)"
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    return 1 if getattr(result, "error", None) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

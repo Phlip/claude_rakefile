@@ -1,12 +1,11 @@
 
-
   #  a Rakefile is a command line aggregator
 
   # TODO  system to download a Dockerfile environment
 # ask mr machine to
   #  curl -LsSf https://astral.sh/uv/install.sh | sh
 
-  # .---.
+  #                 .---.
   #               /  .-.  \
   #              /  /   \  \
   #             /  /  .-.|  |
@@ -21,18 +20,6 @@
   #       \ \  |  |   |    \/  / /
   #        \ \/   /    \      / /
   #         \____/      \____/
-  #
-  #   _   _ _   _ ____  _____    _    _
-  #  | | | | \ | |  _ \|  ___|  / \  | |
-  #  | | | |  \| | |_) | |_    / _ \ | |
-  #  | |_| | |\  |  _ <|  _|  / ___ \| |___
-  #   \___/|_| \_|_| \_\_|   /_/   \_\_____|
-  #
-  #  _____ ____  _   _ ____  _   _    _    __  __ _____ _  _ _____
-  # |_   _/ __ \| | | |  _ \| \ | |  / \  |  \/  | ____| \| |_   _|
-  #   | || |  | | | | | |_) |  \| | / _ \ | |\/| |  _| | .` | | |
-  #   | || |__| | |_| |  _ <| |\  |/ ___ \| |  | | |___| |\  | | |
-  #   |_| \____/ \___/|_| \_|_| \_/_/   \_\_|  |_|_____|_| \_| |_|
 
 
 require 'fileutils'
@@ -46,6 +33,7 @@ ANTHROPIC_BASE_URL = ENV['ANTHROPIC_BASE_URL'] || 'https://app-llmproxy.surgehq.
 ANTHROPIC_USER_ID = ENV['ANTHROPIC_USER_ID']
 
 namespace :claude do
+
   desc "Run claude on a target path using CLAUDE.md guidelines (invokes the actual CLI binary name, `claude`)"
   task :run, [:path] do |_t, args|
     target_path = File.expand_path(args[:path] || '.')
@@ -60,7 +48,7 @@ namespace :claude do
     }.compact
 
     # Invokes claude within the context directory of the targeted CLAUDE.md
-    system(env, 'claude-code', chdir: target_path) || raise("claude execution failed")
+    system(env, 'claude', chdir: target_path) || raise("claude execution failed")
   end
 
   CLAUDE_IMAGE = 'claude-sandbox'
@@ -96,8 +84,7 @@ namespace :claude do
       # Edits land on the mounted host directory, so skipping prompts is opt-in
       cmd << '--dangerously-skip-permissions' if ENV['SKIP_PERMISSIONS'] == '1'
     end
-p cmd
-    # system(*cmd) || raise('claude (docker) execution failed')
+    system(*cmd) || raise('claude (docker) execution failed')
   end
 
   desc 'Run Claude Code in a throwaway ubuntu:24.04 container, installed fresh each time (headless with a prompt)'
@@ -120,9 +107,10 @@ p cmd
 
     system(*cmd) || raise('claude (popup) execution failed')
   end
+
 end
 # ==============================================================================
-# CONFIGURATION & REPOSITORY BOOTSTRAP
+# CONFIBULATION & REPOSITORY BOOTSTRAP
 # ==============================================================================
 # Sets up global paths and declares Rake directory dependencies.
 #
@@ -146,6 +134,7 @@ directory 'vendor'
 desc 'Full worker lifecycle execution'
 task default: %i[sync_toolkit select_docker verify_and_submit]
 
+
 desc 'Check for latest Surge AI toolkit and optionally update/install'
 task :sync_toolkit => 'vendor' do
   if Dir.exist?(TOOLKIT_DIR)
@@ -166,7 +155,6 @@ task :sync_toolkit => 'vendor' do
   else
   end
 end
-
 
 
 desc 'Search GitHub for Dockerfiles running Ruby GUI apps'
@@ -194,8 +182,7 @@ task :find_gui_dockers do
     data = JSON.parse(res.body)
     puts "Found #{data['total_count']} candidate Dockerfiles (showing top #{data['items'].size}):\n\n"
 
-
-data['items'].each do |item|
+    data['items'].each do |item|
       repo_slug = item['repository']['full_name'].tr('/', '_')
       filename = "#{repo_slug}_Dockerfile.txt"
 
@@ -305,7 +292,9 @@ end
 # Wraps the authoring toolkit's scripts/ as a dependency graph, so the README's
 # build -> run -> reference -> submit sequence is encoded rather than remembered.
 #
-# TASK_TOOLKIT: authoring toolkit checkout (override with TASK_TOOLKIT=...).
+# TASK_TOOLKIT: authoring toolkit checkout, the Zeta platform's by default; a path relative to this
+# Rakefile's folder, or absolute. For the Human Essentials toolkit instead:
+#   TASK_TOOLKIT=awbw/worker-toolkit-human-essentials rake task:list
 #
 #   rake 'task:from_snapshot[explore/snapshots/<dir>]'
 #   rake 'task:build[my-slug]'
@@ -314,12 +303,51 @@ end
 #   rake 'task:regrade[my-slug]'    # re-grades every reference run
 #   rake 'task:submit[my-slug]'     # refuses with fewer than 4 reference runs
 #   rake 'task:all[my-slug]'        # run -> reference -> submit
+#
+# AUTHORING_CONTAINER: harbor is installed only in the toolkit's Authoring devcontainer, so run, reference,
+# and regrade go through that container whenever harbor isn't on this machine's PATH. Set
+# AUTHORING_CONTAINER=1 to always use the container, or 0 to always run on this machine.
+#   rake 'task:all_runs[my-slug,4]'                         # uses the container if harbor is missing here
+#   AUTHORING_CONTAINER=1 rake 'task:run[my-slug,4]'        # always in the container
+#   rake authoring:shell                                    # a shell inside it, for anything by hand
 # ==============================================================================
-TASK_TOOLKIT = File.expand_path(ENV['TASK_TOOLKIT'] || 'awbw/worker-toolkit-human-essentials', __dir__)
+TASK_TOOLKIT = File.expand_path(ENV['TASK_TOOLKIT'] || '../worker-toolkit-zeta-platform', __dir__)
 MIN_REFERENCE_RUNS = 4
 
 def toolkit_sh(cmd)
   cd(TASK_TOOLKIT) { sh cmd }
+end
+
+# Whether harbor's commands should run in the Authoring devcontainer: as AUTHORING_CONTAINER says, or else
+# whenever this machine has no harbor of its own
+def in_authoring_container?
+  case ENV['AUTHORING_CONTAINER']
+  when '1' then true
+  when '0' then false
+  else !system('command -v harbor > /dev/null 2>&1')
+  end
+end
+
+# Runs a toolkit command where harbor is: here, or in the Authoring devcontainer, started first if need be.
+# The container mounts the toolkit at /workspace and this machine's docker socket, so its trials run on this
+# machine's Docker, and it reads the toolkit's .env
+def authoring_sh(cmd)
+  return toolkit_sh(cmd) unless in_authoring_container?
+
+  toolkit_sh 'npx @devcontainers/cli up --workspace-folder .'
+  toolkit_sh "npx @devcontainers/cli exec --workspace-folder . #{cmd}"
+end
+
+namespace :authoring do
+  desc "Start the toolkit's Authoring devcontainer, where harbor lives"
+  task :up do
+    toolkit_sh 'npx @devcontainers/cli up --workspace-folder .'
+  end
+
+  desc 'Open a shell inside the Authoring devcontainer'
+  task shell: :up do
+    toolkit_sh 'npx @devcontainers/cli exec --workspace-folder . bash'
+  end
 end
 
 # The scaffold ships a template holistic-rubric.md, so existence alone doesn't mean it's written
@@ -511,7 +539,7 @@ namespace :task do
   desc 'Run N parallel harbor trials of a task (default 4)'
   task :run, [:slug, :trials] => :build do |_t, args|
     trials = args[:trials] || MIN_REFERENCE_RUNS
-    toolkit_sh "scripts/harbor-run harbor-tasks/#{require_slug(args)} --force-build -k #{trials}"
+    authoring_sh "scripts/harbor-run harbor-tasks/#{require_slug(args)} --force-build -k #{trials}"
   end
 
   desc 'Copy every trial from the newest harbor job into reference-runs'
@@ -523,12 +551,13 @@ namespace :task do
     raise "No harbor job found for #{slug}; run task:run first" if jobs.empty?
 
     job = File.basename(jobs.max_by { |j| File.mtime(j) })
-    toolkit_sh "npx tsx scripts/copy-reference-run.ts harbor-jobs/#{job}/#{slug}__*"
+    # In the container, the trial files it wrote as root are its to copy
+    authoring_sh "npx tsx scripts/copy-reference-run.ts harbor-jobs/#{job}/#{slug}__*"
   end
 
   desc 'Re-grade every captured reference run (after editing the rubric)'
   task :regrade, [:slug] do |_t, args|
-    toolkit_sh "scripts/harbor-regrade harbor-tasks/#{require_slug(args)} --all"
+    authoring_sh "scripts/harbor-regrade harbor-tasks/#{require_slug(args)} --all"
   end
 
   desc 'Fail unless the task has a holistic rubric'
@@ -568,7 +597,7 @@ namespace :app do
     end
   end
 
-  desc 'Start the Explore container and boot the human-essentials app (http://localhost:3400, test@example.com / password!)'
+  desc 'Start the Explore container and boot the Zeta app (http://localhost:3300; run-app prints the login)'
   task(:run) { run_app }
 
   desc 'Stop the app in the Explore container'
@@ -579,6 +608,23 @@ namespace :app do
 
   desc 'Follow the app logs (Ctrl-C stops following, not the app)'
   task(:logs) { run_app '--logs' }
+end
+
+namespace :explore do
+  desc "Read an unzipped toolkit's repo slug from toolkit.json, then open a shell in its Explore container (default: TASK_TOOLKIT)"
+  task :shell, [:toolkit] do |_t, args|
+    require 'json'
+    toolkit = File.expand_path(args[:toolkit] || TASK_TOOLKIT, __dir__)
+    manifest = File.join(toolkit, 'toolkit.json')
+    raise "No toolkit.json in #{toolkit}; point at the unzipped toolkit folder" unless File.exist?(manifest)
+
+    slug = JSON.parse(File.read(manifest))['repo']
+    puts "Toolkit slug: #{slug}"
+    cd(File.join(toolkit, 'explore')) do
+      sh 'npx @devcontainers/cli up --workspace-folder .'
+      sh 'npx @devcontainers/cli exec --workspace-folder . bash'
+    end
+  end
 end
 
 require "io/console"
@@ -652,7 +698,7 @@ end
 
 
 desc "Run Shoes application headlessly under Xvfb"
-task :default do
+task :shoes do
   sh "xvfb-run --auto-servernum ruby app.rb"
 end
 

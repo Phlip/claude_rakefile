@@ -1,0 +1,600 @@
+#!/bin/bash
+# Re-grade an existing reference run without re-invoking the agent.
+#
+# Spins up a normal harbor trial, but plugs in scripts/replay_agent.py
+# instead of a real agent. The replay agent overlays the captured
+# agent-output into /workspace, applies any captured deletions, drops
+# the captured trajectory at /logs/agent/trajectory.json so the grader
+# reads the same transcript it would for the original run, then exits.
+# The verifier (real test.sh, real LLM grader if present) runs as it
+# would for any other trial.
+#
+# Usage:
+#   scripts/harbor-regrade <task-dir> <reference-run-dir> [extra harbor args]
+#
+# Examples:
+#   # Single regrade
+#   scripts/harbor-regrade \
+#       harbor-tasks/<slug> \
+#       harbor-tasks/<slug>/reference-runs/reward-0.62-h4KNEAg
+#
+#   # Every captured run for a task, 2 at a time (after a rubric edit)
+#   scripts/harbor-regrade harbor-tasks/<slug> --all
+#
+#   # Ten regrades of the same reference run (independent grader trials)
+#   scripts/harbor-regrade \
+#       harbor-tasks/<slug> \
+#       harbor-tasks/<slug>/reference-runs/reward-0.62-h4KNEAg \
+#       -k 10
+#
+# --fast runs the GRADER in claude's fast serving mode (faster output at a higher
+# token rate). The replay agent runs no model, so the grader is the only model in
+# this path. Serving speed and cost change; the grade itself is not steered.
+#
+# A finished regrade files itself when nothing is filed for that run yet — which is
+# only ever the atomic case, since a run always carries a holistic grade already.
+# Otherwise it grades and leaves the result in its job dir, so the tune-and-diff loop
+# is untouched; --replace adopts it, superseding what was there.
+#
+# See scripts/replay_agent.py for what the agent actually does, and the
+# `verifier: capture tracked-file deletions in agent-output` PR for the
+# capture half of this flow (_HARBOR_DELETIONS.txt).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# A sample count from the caller wins over .env, so a prefix can override a standing
+# setting for one regrade. Captured as one value so a caller's spelling beats .env's,
+# whichever each used (test.sh reads GRADER_SAMPLES; this script has long taken both).
+_CALLER_SAMPLES="${GRADER_SAMPLES:-${HARBOR_GRADER_SAMPLES:-}}"
+
+# Source API key + any verifier env from the repo's .env
+if [ -f "$REPO_ROOT/.env" ]; then
+    set -a
+    source "$REPO_ROOT/.env"
+    set +a
+fi
+
+# The grader authenticates with ANTHROPIC_API_KEY straight out of the .env sourced above, so
+# a .env saved on Windows would hand it a value with a carriage return still attached.
+if [ -f "$SCRIPT_DIR/lib/harness-credentials.sh" ]; then
+    # shellcheck disable=SC1091
+    HARNESS_SCRIPTS_DIR="$SCRIPT_DIR" . "$SCRIPT_DIR/lib/harness-credentials.sh" >/dev/null 2>&1 || true
+    harness_setup_credentials >/dev/null 2>&1 || true
+fi
+
+if [ -f "$REPO_ROOT/scripts/lib/llm-proxy-env.sh" ]; then
+    . "$REPO_ROOT/scripts/lib/llm-proxy-env.sh" && apply_llm_proxy_env
+fi
+
+# When running inside a devcontainer, harbor needs HOST paths for docker
+# bind mounts (the docker daemon is on the host).
+if [ -n "${HOST_WORKSPACE:-}" ] && [ -d "$HOST_WORKSPACE" ]; then
+    cd "$HOST_WORKSPACE"
+fi
+
+usage() {
+    cat >&2 <<EOF
+Usage: scripts/harbor-regrade <task-dir> <reference-run-dir>... [extra harbor args]
+       scripts/harbor-regrade <task-dir> --all [extra harbor args]
+
+Required arguments:
+  <task-dir>           harbor-tasks/<slug> — same dir you'd pass to scripts/harbor-run.
+  <reference-run-dir>  harbor-tasks/<slug>/reference-runs/<run-id> — must contain
+                       agent-output/ (and ideally agent/trajectory.json). Name several
+                       to re-grade them all; each gets its own harbor job.
+
+Optional arguments:
+  --all                re-grade every run under <task-dir>/reference-runs/ — the usual
+                       thing to do after editing the rubric.
+  --jobs N             how many runs to re-grade at once (default 2). Each one is a
+                       container, so raise it only as far as your machine allows.
+  --fast               grade in claude's fast serving mode (higher token rate,
+                       faster output). Anything else is passed through to harbor.
+  --replace            adopt the result, replacing the grade already filed for this
+                       run. Without it, a regrade that would overwrite an existing
+                       grade is left in its job dir for you to compare first.
+
+Note: -k re-grades the SAME run N times (N independent grades of one trajectory).
+To re-grade DIFFERENT runs, name them all, or use --all.
+EOF
+    exit 1
+}
+
+# `--fast` is consumed here (harbor has no such flag); everything else stays an opaque
+# passthrough. Stripped first so it may appear anywhere, not just after the positionals.
+FAST_REQUESTED=""
+ALL_RUNS=""
+REPLACE=""
+JOBS=2
+REGRADE_ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fast) FAST_REQUESTED=1; shift ;;
+        --replace) REPLACE=1; shift ;;
+        --all) ALL_RUNS=1; shift ;;
+        --jobs)
+            [ $# -ge 2 ] || { echo "Error: --jobs needs a number." >&2; exit 1; }
+            JOBS="$2"; shift 2 ;;
+        --jobs=*) JOBS="${1#--jobs=}"; shift ;;
+        *) REGRADE_ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${REGRADE_ARGS[@]+"${REGRADE_ARGS[@]}"}"
+
+# Normalised to base 10 before any (( )) sees it: "09" passes a -ge test but is
+# invalid octal in arithmetic, which spun the dispatch loop forever.
+case "$JOBS" in
+    '' | *[!0-9]*) JOBS_OK="" ;;
+    *) JOBS=$((10#$JOBS)); [ "$JOBS" -ge 1 ] && JOBS_OK=1 || JOBS_OK="" ;;
+esac
+if [ -z "$JOBS_OK" ]; then
+    echo "Error: --jobs must be a positive integer (got '$JOBS')." >&2
+    exit 1
+fi
+
+[ $# -lt 1 ] && usage
+TASK_DIR="$1"
+shift
+
+# Leading non-flag positionals are reference runs; collection stops at the first
+# harbor flag so `<task> <ref> -k 4` keeps working and `4` is never read as a run.
+REF_DIRS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -*) break ;;
+        *) REF_DIRS+=("$1"); shift ;;
+    esac
+done
+
+# Resolve to absolute paths — harbor cd's around internally; the replay
+# agent receives the path as an --agent-kwarg and won't know our cwd.
+TASK_DIR_ABS=$(cd "$TASK_DIR" 2>/dev/null && pwd) || {
+    echo "Error: task-dir does not exist: $TASK_DIR" >&2
+    exit 1
+}
+
+# Unfiltered on purpose: the child, not a name test here, decides what can be replayed.
+if [ -n "$ALL_RUNS" ]; then
+    [ ${#REF_DIRS[@]} -gt 0 ] && {
+        echo "Error: pass --all or explicit reference-run dirs, not both." >&2
+        exit 1
+    }
+    REF_PARENT="$TASK_DIR_ABS/reference-runs"
+    [ -d "$REF_PARENT" ] || {
+        echo "Error: --all needs $REF_PARENT, which does not exist." >&2
+        exit 1
+    }
+    for _cand in "$REF_PARENT"/*/; do
+        [ -d "$_cand" ] && REF_DIRS+=("${_cand%/}")
+    done
+    [ ${#REF_DIRS[@]} -eq 0 ] && {
+        echo "Error: $REF_PARENT holds no reference runs." >&2
+        exit 1
+    }
+fi
+
+[ ${#REF_DIRS[@]} -eq 0 ] && usage
+
+# Several runs: re-run ITSELF once each, so every child does the full preflight in an
+# output dir of its own — harbor names job dirs by the second, and sharing one corrupts.
+if [ ${#REF_DIRS[@]} -gt 1 ]; then
+    OUT_BASE="${HARBOR_REGRADE_OUT:-harbor-jobs}"
+    mkdir -p "$OUT_BASE"
+    CHILD_FLAGS=()
+    [ -n "$FAST_REQUESTED" ] && CHILD_FLAGS+=(--fast)
+    [ -n "$REPLACE" ] && CHILD_FLAGS+=(--replace)
+    echo "Re-grading ${#REF_DIRS[@]} reference runs, $JOBS at a time."
+    FAILED=()
+    FAILED_LOGS=()
+    BATCH_PIDS=()
+    # Without this a killed driver leaves its children running, and on a cloud backend
+    # each one is a sandbox that bills until something else reaps it.
+    trap '[ ${#BATCH_PIDS[@]} -gt 0 ] && kill -TERM "${BATCH_PIDS[@]}" 2>/dev/null; exit 143' TERM
+    trap '[ ${#BATCH_PIDS[@]} -gt 0 ] && kill -TERM "${BATCH_PIDS[@]}" 2>/dev/null; exit 130' INT
+    IDX=0
+    TOTAL=${#REF_DIRS[@]}
+    while [ "$IDX" -lt "$TOTAL" ]; do
+        BATCH_PIDS=()
+        BATCH_REFS=()
+        BATCH_LOGS=()
+        for ((_j = 0; _j < JOBS && IDX < TOTAL; _j++)); do
+            REF="${REF_DIRS[$IDX]}"
+            RUN_ID=$(basename "$REF")
+            # --job-name, not a nested output dir: children keep harbor's own
+            # harbor-jobs/<job>/<trial> shape. Indexed so duplicate args cannot collide.
+            JOB_NAME="regrade-$((IDX + 1))-$RUN_ID"
+            LOG="$OUT_BASE/$JOB_NAME.log"
+            echo "  starting $RUN_ID (log: $LOG)"
+            "$SCRIPT_DIR/harbor-regrade" "$TASK_DIR_ABS" "$REF" \
+                ${CHILD_FLAGS[@]+"${CHILD_FLAGS[@]}"} "$@" \
+                --job-name "$JOB_NAME" > "$LOG" 2>&1 &
+            BATCH_PIDS+=($!)
+            BATCH_REFS+=("$RUN_ID")
+            BATCH_LOGS+=("$LOG")
+            IDX=$((IDX + 1))
+        done
+        for ((_i = 0; _i < ${#BATCH_PIDS[@]}; _i++)); do
+            if wait "${BATCH_PIDS[$_i]}"; then
+                echo "  ok      ${BATCH_REFS[$_i]}"
+            else
+                echo "  FAILED  ${BATCH_REFS[$_i]}"
+                FAILED+=("${BATCH_REFS[$_i]}")
+                FAILED_LOGS+=("${BATCH_LOGS[$_i]}")
+            fi
+        done
+    done
+    if [ ${#FAILED[@]} -gt 0 ]; then
+        echo "${#FAILED[@]} of $TOTAL failed. Their output, in full — re-running is safe:" >&2
+        for _f in "${FAILED_LOGS[@]}"; do echo "  $_f" >&2; done
+        exit 1
+    fi
+    echo "All $TOTAL re-graded."
+    # Children file their own grades into per-run logs we do not echo, so count the
+    # results rather than claiming them. Only the atomic destination is countable:
+    # a superseded run is gone, so there is no before/after to compare against.
+    case "${HARBOR_GRADER_MODE:-}" in
+        rubric-*)
+            FILED=0
+            for _r in "${REF_DIRS[@]}"; do
+                [ -d "$TASK_DIR_ABS/rubric-regrades/$(basename "$_r")" ] && FILED=$((FILED + 1))
+            done
+            echo "Filed $FILED of $TOTAL into $TASK_DIR_ABS/rubric-regrades/."
+            if [ "$FILED" -lt "$TOTAL" ]; then
+                echo "The rest are still in their job dirs; their logs above say why." >&2
+            fi
+            ;;
+    esac
+    exit 0
+fi
+
+REF_RUN_DIR="${REF_DIRS[0]}"
+REF_RUN_DIR_ABS=$(cd "$REF_RUN_DIR" 2>/dev/null && pwd) || {
+    echo "Error: reference-run-dir does not exist: $REF_RUN_DIR" >&2
+    exit 1
+}
+
+# Newer-generation Dockerfiles COPY environment/dns-jail/, a derived directory
+# that harbor-run pre-stages but a bare regrade context may lack — the sandbox
+# build then fails before the verifier ever starts. Recreate it the same way.
+if [ -d "$TASK_DIR_ABS/environment" ]; then
+    mkdir -p "$TASK_DIR_ABS/environment/dns-jail"
+    for DNSJAIL_SRC in "$REPO_ROOT/scripts/lib/dns-jail-container.sh" \
+                       "$REPO_ROOT/task-shared/dns-jail-container.sh"; do
+        if [ -f "$DNSJAIL_SRC" ]; then
+            # Rename into place: children share this task dir, and a half-written
+            # script is one a sibling's image build can pick up.
+            _dnsjail_dst="$TASK_DIR_ABS/environment/dns-jail/dns-jail-container.sh"
+            cp "$DNSJAIL_SRC" "$_dnsjail_dst.tmp.$$" && mv -f "$_dnsjail_dst.tmp.$$" "$_dnsjail_dst"
+            break
+        fi
+    done
+fi
+
+# Rubric grader modes (HARBOR_GRADER_MODE=rubric-*) read tests/render-rubric-grade.py,
+# a shared asset like the dns-jail script above. A task created before the rubric
+# renderer shipped has no copy, and a stale copy aggregates with outdated weights;
+# either way the regrade must run against the current shared copy. Stage it
+# host-side — the container only ever sees the task directory. The source lives at
+# harbor-tasks/raccoon-shared/ in the internal repo and task-shared/ in a worker
+# toolkit checkout; first one present wins.
+case "${HARBOR_GRADER_MODE:-}" in
+    rubric-*)
+        RUBRIC_RENDER_DEST="$TASK_DIR_ABS/tests/render-rubric-grade.py"
+        for RUBRIC_RENDER_SRC in "$REPO_ROOT/harbor-tasks/raccoon-shared/render-rubric-grade.py" \
+                                 "$REPO_ROOT/task-shared/render-rubric-grade.py"; do
+            [ -f "$RUBRIC_RENDER_SRC" ] || continue
+            if [ ! -f "$RUBRIC_RENDER_DEST" ] || ! cmp -s "$RUBRIC_RENDER_SRC" "$RUBRIC_RENDER_DEST"; then
+                mkdir -p "$TASK_DIR_ABS/tests"
+                cp "$RUBRIC_RENDER_SRC" "$RUBRIC_RENDER_DEST.tmp.$$" &&
+                    mv -f "$RUBRIC_RENDER_DEST.tmp.$$" "$RUBRIC_RENDER_DEST"
+                echo "Note: staged the current shared render-rubric-grade.py into $TASK_DIR_ABS/tests (rubric grader mode)." >&2
+            fi
+            break
+        done
+        ;;
+esac
+
+# NOTE: agent-output/ is intentionally NOT required here. Advisory tasks (the
+# agent only reads + answers in chat) make no workspace edits, so a faithful
+# capture has an empty/absent agent-output/ — the deliverable lives in the
+# captured transcript (agent/trajectory.json) that the grader reads. ReplayAgent
+# overlays agent-output/ when present and otherwise grades base-workspace +
+# transcript, but FAILS LOUDLY if the transcript shows file-mutating tool calls
+# with no agent-output/ (genuine lost edits). So we let it make that call.
+if [ ! -d "$REF_RUN_DIR_ABS/agent-output" ]; then
+    echo "Note: $REF_RUN_DIR_ABS has no agent-output/ — replaying as an" >&2
+    echo "      advisory run (base workspace + captured transcript). See" >&2
+    echo "      scripts/replay_agent.py for the lost-edits safety guard." >&2
+fi
+
+# Make scripts/ importable so harbor can find replay_agent:ReplayAgent.
+# ${PYTHONPATH:+...} so an unset PYTHONPATH doesn't leave a trailing colon —
+# python treats the resulting empty entry as the CWD, silently putting
+# whatever directory the user ran this from on harbor's sys.path.
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
+# Environment backend. Explicit HARBOR_ENV wins; otherwise default to docker in
+# a worker-toolkit checkout (detected by toolkit.json at the repo root) and
+# daytona in the internal repo. See scripts/harbor-run for the full rationale
+# (why the toolkit needs docker, why the marker is a workspace file not an image
+# env, and why daytona must NOT pass --no-delete — billed sandbox).
+if [ -n "${HARBOR_ENV:-}" ]; then
+    ENV_TYPE="$HARBOR_ENV"
+elif [ -f "$REPO_ROOT/toolkit.json" ]; then
+    ENV_TYPE="docker"
+else
+    ENV_TYPE="daytona"
+fi
+DELETE_FLAGS="--no-delete"
+case "$ENV_TYPE" in daytona|modal) DELETE_FLAGS="" ;; esac
+
+# Modal bills a sandbox's REQUESTED cpu/memory for its whole life, and harbor's default
+# `auto` requests the task's full cpus/memory_mb; `limit` requests Modal's floor and caps
+# at the declared values. Override: HARBOR_CPUS_POLICY / HARBOR_MEMORY_POLICY.
+RESOURCE_FLAGS=""
+[ "$ENV_TYPE" = "modal" ] && RESOURCE_FLAGS="--cpus ${HARBOR_CPUS_POLICY:-limit} --memory ${HARBOR_MEMORY_POLICY:-limit}"
+
+if [ "$ENV_TYPE" = "daytona" ] && [ -z "${DAYTONA_API_KEY:-}" ]; then
+    echo "Error: harbor backend resolved to daytona but DAYTONA_API_KEY is unset." >&2
+    echo "Add DAYTONA_API_KEY to $REPO_ROOT/.env, or run with HARBOR_ENV=docker." >&2
+    exit 1
+fi
+
+# Output dir. harbor names the job subdir by second-granularity timestamp, so
+# many regrades launched in the same second under one -o collide
+# ("Job directory ... already exists and cannot be resumed"). Set
+# HARBOR_REGRADE_OUT to a per-run unique dir when running a parallel sweep.
+OUT_DIR="${HARBOR_REGRADE_OUT:-harbor-jobs}"
+
+# Optional grader mode: HARBOR_GRADER_MODE=one-shot flips the task's test.sh into
+# the no-tools one-shot grader (vs the default agentic grader) via verifier env —
+# lets us A/B the agenticity gap without forking the task. See raccoon-shared/test.sh.
+GRADER_MODE_FLAG=()
+[ -n "${HARBOR_GRADER_MODE:-}" ] && GRADER_MODE_FLAG=(--verifier-env "GRADER_MODE=$HARBOR_GRADER_MODE")
+
+# Optional grader model: HARBOR_GRADER_MODEL=claude-fable-5-1 overrides the grader's
+# model (default: the `opus` alias) via verifier env — lets us A/B the grader model
+# inside the unchanged agentic harness. See raccoon-shared/test.sh GRADER_MODEL.
+[ -n "${HARBOR_GRADER_MODEL:-}" ] && GRADER_MODE_FLAG+=(--verifier-env "GRADER_MODEL=$HARBOR_GRADER_MODEL")
+
+# Optional sample count, under either name. Unset, the task's own frozen tests/test.sh
+# decides: tasks created before Sep 2026 average 3 samples, newer ones grade once.
+_SAMPLES="${_CALLER_SAMPLES:-${GRADER_SAMPLES:-${HARBOR_GRADER_SAMPLES:-}}}"
+if [ -n "$_SAMPLES" ]; then
+    if ! [ "$_SAMPLES" -ge 1 ] 2>/dev/null; then
+        echo "harbor-regrade: ERROR — GRADER_SAMPLES must be a positive integer (got '$_SAMPLES')." >&2
+        exit 1
+    fi
+    GRADER_MODE_FLAG+=(--verifier-env "GRADER_SAMPLES=$_SAMPLES")
+fi
+
+# Optional API timeout: HARBOR_API_TIMEOUT_MS=<ms> raises the per-request API
+# timeout of the grader's claude calls via verifier env (API_TIMEOUT_MS is the
+# env var Claude Code itself reads, so test.sh needs no knowledge of it). For
+# proxies whose responses outlast the CLI default.
+[ -n "${HARBOR_API_TIMEOUT_MS:-}" ] &&
+    GRADER_MODE_FLAG+=(--verifier-env "API_TIMEOUT_MS=$HARBOR_API_TIMEOUT_MS")
+
+# Fast serving mode for the grader's own claude calls (--fast). Per-task tests/ assets
+# are frozen at creation, so say when this task's copy cannot act on the flag. The note
+# names that copy, not a shared path — this script ships to workers under another layout.
+if [ -n "$FAST_REQUESTED" ]; then
+    GRADER_MODE_FLAG+=(--verifier-env "GRADER_FAST_MODE=true")
+    if [ -f "$TASK_DIR_ABS/tests/test.sh" ] &&
+        ! grep -q 'GRADER_FAST_MODE' "$TASK_DIR_ABS/tests/test.sh"; then
+        echo "Note: --fast passed, but this task's tests/test.sh does not read" >&2
+        echo "      GRADER_FAST_MODE, so the grader will run at normal speed —" >&2
+        echo "      its copy predates the flag. Refresh the task's tests/test.sh" >&2
+        echo "      from the current shared grader assets to enable it." >&2
+    fi
+fi
+
+# Carry the SOURCE run's agent identity + model into this replay's own record.
+#
+# A replay reports `replay_agent:ReplayAgent` with model_name null, because no model
+# ran — the behaviour being graded came from the source run. Recording only
+# reference_run_dir makes that a pointer, and pointers dangle: a regrade is normally
+# copied back over the run it regraded, so the source usually no longer exists (501 of
+# 643 on-disk replays already point at a missing dir, none of them in the published
+# manifest either). Stamping the values here makes the replay self-describing, so the
+# originating harness and model survive the source's deletion.
+#
+# Regrading a REGRADE means the source is itself a replay, so copying its own identity
+# forward would overwrite the real provenance with a self-reference: inherit what it
+# inherited instead.
+#
+# Read with python3 rather than jq — jq is not guaranteed on a worker's box, and a
+# missing source result.json must degrade to "unknown", never abort the regrade.
+SOURCE_PROV_FLAGS=()
+if [ -f "$REF_RUN_DIR_ABS/result.json" ]; then
+    SOURCE_PROV=$(python3 -c '
+import json, sys
+try:
+    a = (json.load(open(sys.argv[1])).get("config") or {}).get("agent") or {}
+except Exception:
+    sys.exit(0)
+kw = a.get("kwargs") or {}
+REPLAY = "replay_agent:ReplayAgent"
+if (a.get("import_path") or a.get("name")) == REPLAY:
+    agent, model = kw.get("source_agent_import_path"), kw.get("source_model_name")
+else:
+    agent, model = a.get("import_path") or a.get("name"), a.get("model_name")
+# An already-damaged chain cannot be recovered; leave it honestly unstamped rather
+# than propagating a source that names the replay agent itself.
+print("" if agent == REPLAY else agent or "")
+print(model or "")
+' "$REF_RUN_DIR_ABS/result.json" 2>/dev/null || true)
+    SOURCE_AGENT=$(printf '%s\n' "$SOURCE_PROV" | sed -n 1p)
+    SOURCE_MODEL=$(printf '%s\n' "$SOURCE_PROV" | sed -n 2p)
+    [ -n "$SOURCE_AGENT" ] && SOURCE_PROV_FLAGS+=(--ak "source_agent_import_path=$SOURCE_AGENT")
+    [ -n "$SOURCE_MODEL" ] && SOURCE_PROV_FLAGS+=(--ak "source_model_name=$SOURCE_MODEL")
+fi
+
+# HARBOR_GRADING_STANDARD, when set, is passed through to the task's own
+# tests/test.sh as the GRADING_STANDARD verifier env var. What (if anything)
+# it does is decided by the scripts inside that tests/ directory; a test.sh
+# that reads no such variable ignores it.
+[ -n "${HARBOR_GRADING_STANDARD:-}" ] &&
+    GRADER_MODE_FLAG+=(--verifier-env "GRADING_STANDARD=$HARBOR_GRADING_STANDARD")
+
+# A regrade is all verifier, so every call it makes is the grader's.
+if [ -f "$REPO_ROOT/scripts/lib/call-origin.sh" ]; then
+    . "$REPO_ROOT/scripts/lib/call-origin.sh"
+    _GRADER_METADATA="$(LLM_CALL_ORIGIN=harbor-grading call_origin_metadata)"
+    # `if`, not `[ ... ] && ...`: an AND-list is this block's last statement, so under
+    # `set -e` an empty value would abort the regrade rather than just skip the header.
+    if [ -n "$_GRADER_METADATA" ]; then
+        GRADER_MODE_FLAG+=(
+            --verifier-env
+            "ANTHROPIC_CUSTOM_HEADERS=$CALL_ORIGIN_HEADER: $_GRADER_METADATA"
+        )
+    fi
+fi
+
+# Where this grade would be filed, and whether filing it destroys anything. An atomic
+# regrade lands beside the run in rubric-regrades/<run>; a holistic one replaces the
+# run's own grade, so its destination is always occupied and never files unasked.
+rel() { case "$1" in "$PWD"/*) printf '%s' "${1#"$PWD"/}" ;; *) printf '%s' "$1" ;; esac; }
+
+RUN_ID=$(basename "$REF_RUN_DIR_ABS")
+RUBRIC_MODE=""
+case "${HARBOR_GRADER_MODE:-}" in rubric-*) RUBRIC_MODE=1 ;; esac
+if [ -n "$RUBRIC_MODE" ]; then
+    FILE_DEST="$TASK_DIR_ABS/rubric-regrades/$RUN_ID"
+else
+    FILE_DEST="$REF_RUN_DIR_ABS"
+fi
+
+AUTOFILE=""
+if [ ! -e "$FILE_DEST" ] || [ -n "$REPLACE" ]; then
+    AUTOFILE=1
+fi
+if [ -z "$AUTOFILE" ]; then
+    echo "Note: $(rel "$FILE_DEST")" >&2
+    echo "      already holds a grade, so this regrade will not be filed." >&2
+    echo "      Where it landed is printed when it finishes." >&2
+fi
+
+# Where the trial will land. Harbor's own job name is a second-granularity timestamp,
+# so naming it here is what makes the trial findable afterwards (the fan-out passes one).
+CALLER_JOB_NAME=""
+CALLER_OUT=""
+_prev=""
+for _a in "$@"; do
+    case "$_prev" in
+        --job-name) CALLER_JOB_NAME="$_a" ;;
+        -o | --output-dir) CALLER_OUT="$_a" ;;
+    esac
+    case "$_a" in
+        --job-name=*) CALLER_JOB_NAME="${_a#--job-name=}" ;;
+        --output-dir=*) CALLER_OUT="${_a#--output-dir=}" ;;
+    esac
+    _prev="$_a"
+done
+
+JOB_NAME="$CALLER_JOB_NAME"
+JOB_NAME_FLAG=()
+if [ -n "$AUTOFILE" ] && [ -n "$CALLER_OUT" ]; then
+    echo "Note: -o/--output-dir passed, so this regrade will not be filed into" >&2
+    echo "      $(rel "$FILE_DEST") — copy it yourself when it finishes." >&2
+    AUTOFILE=""
+fi
+if [ -z "$JOB_NAME" ] && [ -z "$CALLER_OUT" ]; then
+    # $$ as well as the epoch: harbor refuses an existing job dir outright, and two
+    # regrades of one run can start in the same second.
+    JOB_NAME="regrade-$RUN_ID-$(date +%s)-$$"
+    JOB_NAME_FLAG=(--job-name "$JOB_NAME")
+fi
+
+# RACCOON_DNS_JAIL is inert here on purpose: replay_agent runs no agent turn, so there is
+# nothing to restrict — only the verifier runs, and it needs the proxy.
+#
+# harbor runs as a child, not under `exec`, so the filing below runs after it exits.
+# TERM/INT are forwarded so a kill here never orphans a job (on cloud, a billing sandbox).
+HARBOR_EXIT=0
+HARBOR_SIGNALLED=""
+harbor run \
+    -p "$TASK_DIR_ABS" \
+    --agent-import-path replay_agent:ReplayAgent \
+    --ak "reference_run_dir=$REF_RUN_DIR_ABS" \
+    ${SOURCE_PROV_FLAGS[@]+"${SOURCE_PROV_FLAGS[@]}"} \
+    -e "$ENV_TYPE" \
+    $DELETE_FLAGS \
+    $RESOURCE_FLAGS \
+    --yes \
+    -o "$OUT_DIR" \
+    ${GRADER_MODE_FLAG[@]+"${GRADER_MODE_FLAG[@]}"} \
+    ${JOB_NAME_FLAG[@]+"${JOB_NAME_FLAG[@]}"} \
+    "$@" &
+HARBOR_PID=$!
+trap 'HARBOR_SIGNALLED=1; kill -TERM "$HARBOR_PID" 2>/dev/null || true' TERM
+trap 'HARBOR_SIGNALLED=1; kill -INT "$HARBOR_PID" 2>/dev/null || true' INT
+wait "$HARBOR_PID" || HARBOR_EXIT=$?
+if [ -n "$HARBOR_SIGNALLED" ]; then
+    # The first wait was interrupted by the trap; wait again for harbor's real status.
+    wait "$HARBOR_PID" || HARBOR_EXIT=$?
+fi
+trap - TERM INT
+
+# A failed grade has nothing to report on, and a caller-directed -o put the trial
+# somewhere this script cannot name.
+if [ "$HARBOR_EXIT" -ne 0 ] || [ -n "$CALLER_OUT" ]; then
+    exit "$HARBOR_EXIT"
+fi
+
+JOB_DIR="$OUT_DIR/$JOB_NAME"
+TRIALS=()
+for _t in "$JOB_DIR"/*__*/; do
+    [ -d "$_t" ] && TRIALS+=("${_t%/}")
+done
+
+# Atomic grades sit beside the run; a holistic one replaces it, which means removing
+# the directory it supersedes (see copy-reference-run.ts for why swap, not merge).
+COPY_FLAGS=(--rubric-regrade)
+[ -z "$RUBRIC_MODE" ] && COPY_FLAGS=(--supersede "$(rel "$REF_RUN_DIR_ABS")")
+FILE_CMD="npx tsx $(rel "$SCRIPT_DIR")/copy-reference-run.ts ${COPY_FLAGS[*]}"
+
+if [ ${#TRIALS[@]} -eq 0 ]; then
+    echo "Note: no trial directory under $JOB_DIR, so there is no grade." >&2
+    exit "$HARBOR_EXIT"
+fi
+if [ ${#TRIALS[@]} -gt 1 ]; then
+    echo "Note: ${#TRIALS[@]} trials under $JOB_DIR (-k grades one run repeatedly)." >&2
+    echo "      Pick the one to keep and file it:  $FILE_CMD <trial-dir>" >&2
+    exit "$HARBOR_EXIT"
+fi
+
+# Not filing: say where the grade is and how the two compare, since comparing them is
+# the whole reason it was left alone. Adopting is a copy — re-running with --replace
+# would spend the 15-30 minutes again for a grade already sitting on disk.
+if [ -z "$AUTOFILE" ]; then
+    NEW_REWARD=$(cat "${TRIALS[0]}/verifier/reward.txt" 2>/dev/null || echo "?")
+    # A stored atomic grade is a whole trial, so its reward sits under verifier/;
+    # a reference run keeps its own at the top.
+    OLD_REWARD=$(cat "$FILE_DEST/verifier/reward.txt" 2>/dev/null ||
+        cat "$FILE_DEST/reward.txt" 2>/dev/null || echo "?")
+    echo "" >&2
+    echo "Graded, not filed — that run already holds a grade." >&2
+    echo "  new    $NEW_REWARD  $(rel "${TRIALS[0]}")" >&2
+    echo "  filed  $OLD_REWARD  $(rel "$FILE_DEST")" >&2
+    echo "" >&2
+    echo "Adopt this grade:" >&2
+    echo "  npx tsx $(rel "$SCRIPT_DIR")/copy-reference-run.ts \\" >&2
+    echo "    ${COPY_FLAGS[*]} \\" >&2
+    echo "    $(rel "${TRIALS[0]}")" >&2
+    echo "" >&2
+    echo "Or pass --replace next time to file it without this step." >&2
+    exit "$HARBOR_EXIT"
+fi
+
+# Best-effort from here: the grade already cost 15-30 minutes, so a filing problem
+# prints the command to finish by hand rather than failing the regrade.
+if ! npx tsx "$SCRIPT_DIR/copy-reference-run.ts" "${COPY_FLAGS[@]}" "${TRIALS[0]}" >&2; then
+    echo "Warning: the grade is in ${TRIALS[0]} but could not be filed. Retry with:" >&2
+    echo "         $FILE_CMD ${TRIALS[0]}" >&2
+fi
+
+exit "$HARBOR_EXIT"

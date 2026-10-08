@@ -1,0 +1,286 @@
+version = 1
+
+[[harness]]
+id = "claude-code"
+label = "Claude Code"
+agent_import_path = "snapshot_agent:SnapshotClaudeCode"
+# `[metadata] browser = true` swaps in these: same reduced toolset plus `Read`, so an agent
+# given a browser can look at the screenshot it just took. Distinct classes with distinct
+# names, because a different toolset is a different agent.
+agent_import_path_browser = "snapshot_agent:BrowserSnapshotClaudeCode"
+agent_import_path_single_turn_browser = "snapshot_agent:BrowserPreinstalledClaudeCode"
+agent_import_path_single_turn = "snapshot_agent:PreinstalledClaudeCode"
+import_path_aliases = [
+  "snapshot_agent:FullToolsetSnapshotClaudeCode",
+  "snapshot_agent:FullToolsetPreinstalledClaudeCode",
+  "harbor.agents.installed.claude_code:ClaudeCode",
+]
+legacy_bare_model_rows = true
+default_model = "claude-opus-5[1m]"
+model_id_shape = "bare"
+effort_kwarg = "reasoning_effort"
+effort_default = "max"
+fast_kwarg = "fast_mode"
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = true
+seed_native = true
+seed_atif = true
+authoring = true
+cli = "claude"
+install = "for i in 1 2 3; do curl -fsSL https://claude.ai/install.sh | bash && break; echo \"claude install attempt $i failed; retrying in 10s\" >&2; sleep 10; done"
+# No agent_config: claude reduces its toolset with `--tools`, not `-c key=value`, so the
+# reduction is a launch flag here and `--tools Bash` in snapshot_agent.py for the trial.
+# Two expressions of one intent, which the $RACCOON_AGENT_FLAGS guard cannot police —
+# unlike model and effort, which are interpolated from this row.
+explore_launch = """exec claude --model '$RACCOON_MODEL' --effort $RACCOON_EFFORT --tools "$RACCOON_TOOLS" --append-system-prompt "$RACCOON_TOOLSET_NOTE" --plugin-dir /workspace/plugins/create-snapshot --dangerously-skip-permissions "$@""""
+
+[[harness]]
+id = "codex"
+label = "OpenAI Codex CLI"
+agent_import_path = "codex_agent:NativeSnapshotCodex"
+agent_import_path_single_turn = "codex_agent:SystemNodeCodex"
+import_path_aliases = [
+  "codex_agent:InlineSnapshotCodex",
+  "harbor.agents.installed.codex:Codex",
+]
+legacy_bare_model_rows = true
+default_model = "gpt-5.6-sol"
+model_id_shape = "bare"
+effort_kwarg = "reasoning_effort"
+effort_default = "max"
+key_env = "OPENAI_API_KEY"
+base_url_env = "OPENAI_BASE_URL"
+proxy_path = "openai/v1"
+writes_atif = true
+capture = true
+seed_native = true
+seed_atif = true
+authoring = true
+cli = "codex"
+install = "for i in 1 2 3; do curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh && break; echo \"codex install attempt $i failed; retrying in 10s\" >&2; sleep 10; done"
+skills_dir = "$HOME/.agents/skills"
+config_path = "${CODEX_HOME:-$HOME/.codex}/config.toml"
+auth_path = "${CODEX_HOME:-$HOME/.codex}/auth.json"
+auth_key_env = "OPENAI_API_KEY"
+agent_config = """
+web_search = "disabled"
+
+[agents]
+enabled = false
+
+[tools]
+update_plan = { enabled = false }
+experimental_request_user_input = { enabled = false }
+
+[features]
+goals = false
+multi_agent = false
+multi_agent_v2 = false
+memories = false
+external_agent_memory_import = false
+"""
+# A provider of our own, not the built-in `openai`: codex reserves built-in provider ids,
+# and env_http_headers — the only place codex can be told to send the call-origin header —
+# is a per-provider setting. base_url has to live in the table with it (a provider without
+# one silently falls back to api.openai.com), so harness_refresh_config_keys refreshes
+# [model_providers.*] keys as well as root ones.
+container_config = """
+model_provider = "llm-proxy"
+
+[model_providers.llm-proxy]
+name = "LLM proxy"
+base_url = "${OPENAI_BASE_URL}"
+# A custom provider reads its key from this env var and never from auth.json, so it
+# names the one key .env actually carries. That makes the key live per launch rather
+# than baked at container create — better than the auth-file path it replaces.
+env_key = "ANTHROPIC_API_KEY"
+wire_api = "responses"
+env_http_headers = { "X-Surge-Client-Metadata" = "LLM_CALL_METADATA" }
+"""
+explore_config = """
+[hooks]
+SessionStart = [ { hooks = [ { type = "command", command = "/workspace/plugins/create-snapshot/bin/save-session-info.mjs" } ] } ]
+UserPromptSubmit = [ { hooks = [ { type = "command", command = "/workspace/plugins/create-snapshot/bin/checkpoint-workspace.mjs" } ] } ]
+"""
+explore_launch = """exec codex $RACCOON_AGENT_FLAGS --model $RACCOON_MODEL -c model_reasoning_effort=$RACCOON_EFFORT ${RACCOON_BROWSER_FLAGS[@]+"${RACCOON_BROWSER_FLAGS[@]}"} --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "$@""""
+
+[[harness]]
+id = "gemini-cli"
+label = "Gemini CLI"
+agent_import_path = "gemini_agent:NativeSnapshotGeminiCli"
+agent_import_path_single_turn = "gemini_agent:SystemNodeGeminiCli"
+import_path_aliases = ["harbor.agents.installed.gemini_cli:GeminiCli"]
+legacy_bare_model_rows = true
+default_model = "gemini-3.5-flash"
+model_id_shape = "provider/model"
+effort_kwarg = "reasoning_effort"
+effort_default = "high"
+key_env = "GEMINI_API_KEY"
+base_url_env = "GEMINI_API_BASE"
+proxy_path = "gemini"
+writes_atif = true
+capture = false
+seed_native = true
+seed_atif = false
+
+[[harness]]
+id = "antigravity-cli"
+label = "Antigravity CLI"
+agent_import_path = "harness_agents:BenchAntigravity"
+import_path_aliases = ["harbor.agents.installed.antigravity_cli:AntigravityCli"]
+legacy_bare_model_rows = false
+# The prefix is load-bearing: harbor's adapter raises without a "/" in the id.
+# agy carries its own model catalogue and DROPS entries between point releases
+# (1.1.25 removed gemini-3.5-flash, breaking every run). If trials start failing
+# with "not recognized as a known model", run `agy --model bogus --prompt=x` to
+# print the current catalogue and update this.
+default_model = "google/gemini-3.8-flash"
+model_id_shape = "provider/model"
+# Not optional: agy refuses a Gemini 3 model with no --effort ("requires --effort
+# (available: low, medium, high)"). low/high are safe on pro and flash alike.
+effort_kwarg = "reasoning_effort"
+effort_default = "high"
+key_env = "GEMINI_API_KEY"
+base_url_env = "GOOGLE_GEMINI_BASE_URL"
+proxy_path = "gemini"
+writes_atif = true
+capture = false
+# agy cannot be handed externally-produced history, so multi-turn tasks must
+# hard-fail rather than silently run cold. See work-logs/antigravity-harness.md.
+seed_native = false
+seed_atif = false
+
+[[harness]]
+id = "opencode"
+label = "OpenCode"
+agent_import_path = "harness_agents:BenchOpenCode"
+legacy_bare_model_rows = false
+model_id_shape = "provider/model"
+effort_kwarg = ""
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+flaky_hangs = true
+
+[[harness]]
+id = "goose"
+label = "Goose"
+agent_import_path = "harness_agents:BenchGoose"
+legacy_bare_model_rows = false
+model_id_shape = "provider/model"
+effort_kwarg = ""
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+
+[[harness]]
+id = "mini-swe-agent"
+label = "mini-swe-agent"
+agent_import_path = "harness_agents:BenchMiniSweAgent"
+legacy_bare_model_rows = false
+model_id_shape = "provider/model"
+effort_kwarg = ""
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+
+[[harness]]
+id = "cline-cli"
+label = "Cline CLI"
+agent_import_path = "harness_agents:BenchCline"
+legacy_bare_model_rows = false
+model_id_shape = "provider:model"
+effort_kwarg = ""
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+
+[[harness]]
+id = "crush"
+label = "Crush"
+agent_import_path = "harness_agents:Crush"
+legacy_bare_model_rows = false
+model_id_shape = "provider/model"
+effort_kwarg = ""
+key_env = "ANTHROPIC_API_KEY"
+base_url_env = "ANTHROPIC_BASE_URL"
+proxy_path = "anthropic"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+flaky_hangs = true
+
+[[harness]]
+id = "amp"
+label = "Amp"
+agent_import_path = "harness_agents:Amp"
+legacy_bare_model_rows = false
+model_id_shape = "bare"
+effort_kwarg = ""
+key_env = "AMP_API_KEY"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+enabled = false
+
+[[harness]]
+id = "cursor-cli"
+label = "Cursor CLI"
+agent_import_path = "harness_agents:BenchCursorCli"
+legacy_bare_model_rows = false
+model_id_shape = "bare"
+effort_kwarg = ""
+key_env = "CURSOR_API_KEY"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+enabled = false
+
+[[harness]]
+id = "copilot-cli"
+label = "GitHub Copilot CLI"
+agent_import_path = "harness_agents:BenchCopilotCli"
+legacy_bare_model_rows = false
+model_id_shape = "bare"
+effort_kwarg = ""
+key_env = "GITHUB_TOKEN"
+writes_atif = true
+capture = false
+seed_native = false
+seed_atif = false
+enabled = false
+
+[[harness]]
+id = "aider"
+label = "Aider"
+agent_import_path = "harness_agents:BenchAider"
+legacy_bare_model_rows = false
+model_id_shape = "provider/model"
+effort_kwarg = ""
+writes_atif = false
+capture = false
+seed_native = false
+seed_atif = false
+enabled = false

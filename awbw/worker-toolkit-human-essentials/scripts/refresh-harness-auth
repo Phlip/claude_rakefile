@@ -1,0 +1,54 @@
+#!/bin/bash
+# Rewrite the auth FILES harnesses read their key from — and the base URL beside them —
+# off the live .env, then exec "$@".
+#
+# codex reads its key from ${CODEX_HOME:-$HOME/.codex}/auth.json, which container-create
+# wrote once from the .env of that moment — so a key rotated afterwards never reached it
+# and needed a rebuild. claude needs none of this: it has an apiKeyHelper that re-reads
+# .env per request. Interactive launches route through here so each one re-derives first.
+#
+# The base URL never rotates, so the case that matters is the one where container-create
+# could not derive it at all (no .env yet) and wrote no config: the key then refreshes
+# fine while codex still has no proxy URL and talks to the provider directly.
+#
+# Trials are unaffected either way: harbor-run re-derives OPENAI_API_KEY per invocation
+# and harbor's codex agent authenticates the sandbox from that env var, not from this file.
+set -uo pipefail
+
+_scripts_dir="${HARNESS_SCRIPTS_DIR:-/workspace/scripts}"
+
+# Subshell, and every failure swallowed: a refresh that cannot run must never stop the
+# agent from starting. The auth file already on disk is the PREVIOUS key, not nothing, so
+# failing open leaves the worker exactly where they were before this wrapper existed.
+(
+    set -a
+    # shellcheck disable=SC1090
+    . "${RACCOON_ENV_FILE:-/workspace/.env}" 2>/dev/null || true
+    set +a
+    # shellcheck disable=SC1091
+    HARNESS_SCRIPTS_DIR="$_scripts_dir" . "$_scripts_dir/lib/harness-credentials.sh" || exit 0
+    harness_setup_credentials
+    harness_write_auth
+    harness_refresh_config_keys
+) >/dev/null 2>&1 || true
+
+# No args is a valid call: refresh only, for a lifecycle hook.
+[ "$#" -gt 0 ] || exit 0
+
+# Outside the subshell, because these have to reach the exec'd command: codex now reads
+# its key from $ANTHROPIC_API_KEY per request, and a non-login shell sourced neither
+# .bashrc (the key, the call origin) nor the profile that puts the CLI on PATH.
+# Failures stay swallowed — an unreadable .env must not stop the agent starting.
+export PATH="$HOME/.local/bin:$PATH"
+if [ -f "${RACCOON_ENV_FILE:-/workspace/.env}" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "${RACCOON_ENV_FILE:-/workspace/.env}" 2>/dev/null || true
+    set +a
+fi
+if [ -f "$HOME/.raccoon-call-origin" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.raccoon-call-origin" 2>/dev/null || true
+fi
+
+exec "$@"
