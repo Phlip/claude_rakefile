@@ -1,5 +1,0 @@
-node_modules
-harbor-jobs
-harbor-tasks/*/environment/workspace
-.env
-.DS_Store

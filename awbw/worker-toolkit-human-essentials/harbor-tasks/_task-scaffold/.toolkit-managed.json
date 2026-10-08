@@ -1,9 +1,0 @@
-{
-  "version": 1,
-  "stampedAt": "2026-09-15T00:04:40.176Z",
-  "files": {
-    "environment/Dockerfile": "faf6e221440e3bc64f22dfdcde040d76ad5befe63234a3c2ed96a82f96448989",
-    "tests/test.sh": "9dba71df2a7e3e1c19f928835f5f963d24f46fc638efa0db6d4e77d6c748c8cc",
-    "tests/grader-system-prompt-consolidated.md": "032ce032728a8c0b2717478b929dbd7535e07c96ffe2e991097dd2c233543275"
-  }
-}
